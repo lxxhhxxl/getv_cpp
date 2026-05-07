@@ -1,0 +1,16 @@
+#构建产物
+build/
+
+#IDE配置，如有
+.vscode
+.idea
+
+#编译中间文件
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.out
