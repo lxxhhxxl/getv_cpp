@@ -1,7 +1,9 @@
 /**
- * V4L2 双线程采集 + 应用层队列缓冲
- * 编译: g++ -std=c++17 -pthread main.cpp -o v4l2_dual_thread
- * 运行: ./v4l2_dual_thread /dev/video0
+ * V4L2 直播推流程序
+ * 功能：采集 → 编码 → RTMP推流（无限循环，类似直播）
+ * 编译: g++ -std=c++17 -pthread main.cpp -o live_stream \
+ *       $(pkg-config --cflags --libs libavcodec libavutil libswscale libavformat)
+ * 运行: ./live_stream rtmp://localhost/live/stream
  */
 
 #include <iostream>
@@ -13,90 +15,95 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <csignal>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
+#include <libavutil/time.h>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
+#include <libavformat/avformat.h>
+}
 
 // ==================== 配置参数 ====================
 constexpr int WIDTH = 640;
 constexpr int HEIGHT = 480;
-constexpr int BUFFER_COUNT = 4;          // V4L2 内核缓冲区数量
-constexpr int QUEUE_MAX_SIZE = 8;        // 应用层队列最大长度（背压控制）
-constexpr int CAPTURE_FRAMES = 300;      // 默认采集 300 帧
+constexpr int FPS = 30;
+constexpr int BUFFER_COUNT = 4;
+constexpr int RAW_QUEUE_SIZE = 8;        // 原始帧队列
+constexpr int PKT_QUEUE_SIZE = 20;       // 编码后 packet 队列
 constexpr uint32_t PIXEL_FORMAT = V4L2_PIX_FMT_YUYV;
 
-// ==================== 帧结构（支持移动语义） ====================
-struct Frame {
-    std::vector<uint8_t> data;           // 应用层独立内存
-    size_t size = 0;
+// ==================== 全局控制（信号处理用） ====================
+std::atomic<bool> g_running{true};
+
+void signal_handler(int sig) {
+    std::cout << "\n[Signal] Caught " << sig << ", stopping..." << std::endl;
+    g_running = false;
+}
+
+// ==================== 帧结构 ====================
+struct RawFrame {
+    std::vector<uint8_t> data;
     uint64_t timestamp_us = 0;
     uint32_t sequence = 0;
 
-    Frame() = default;
-    
-    // 移动构造
-    Frame(Frame&& other) noexcept
-        : data(std::move(other.data)),
-          size(other.size),
-          timestamp_us(other.timestamp_us),
-          sequence(other.sequence) {
-        other.size = 0;
-        other.timestamp_us = 0;
-        other.sequence = 0;
-    }
-    
-    // 移动赋值
-    Frame& operator=(Frame&& other) noexcept {
-        if (this != &other) {
-            data = std::move(other.data);
-            size = other.size;
-            timestamp_us = other.timestamp_us;
-            sequence = other.sequence;
-            other.size = 0;
-            other.timestamp_us = 0;
-            other.sequence = 0;
-        }
-        return *this;
-    }
-    
-    // 禁止拷贝（避免意外深拷贝）
-    Frame(const Frame&) = delete;
-    Frame& operator=(const Frame&) = delete;
+    RawFrame() = default;
+    RawFrame(RawFrame&&) = default;
+    RawFrame& operator=(RawFrame&&) = default;
+    RawFrame(const RawFrame&) = delete;
+    RawFrame& operator=(const RawFrame&) = delete;
 };
 
-// ==================== 线程安全队列（生产者-消费者） ====================
-class FrameQueue {
-public:
-    explicit FrameQueue(size_t max_size) : max_size_(max_size) {}
+struct EncodedPacket {
+    std::vector<uint8_t> data;
+    int64_t pts = 0;
+    int64_t dts = 0;
+    bool is_keyframe = false;
 
-    // 生产者：采集线程 push
-    void push(Frame&& frame) {
+    EncodedPacket() = default;
+    EncodedPacket(EncodedPacket&&) = default;
+    EncodedPacket& operator=(EncodedPacket&&) = default;
+    EncodedPacket(const EncodedPacket&) = delete;
+    EncodedPacket& operator=(const EncodedPacket&) = delete;
+};
+
+// ==================== 线程安全队列 ====================
+template<typename T>
+class ThreadQueue {
+    std::queue<T> queue_;
+    mutable std::mutex mutex_;
+    std::condition_variable cond_;
+    size_t max_size_;
+    std::atomic<bool> stop_{false};
+    std::atomic<size_t> dropped_{0};
+
+public:
+    explicit ThreadQueue(size_t max) : max_size_(max) {}
+
+    void push(T&& item) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            
-            // 背压策略：队列满时丢弃最旧帧
             if (queue_.size() >= max_size_) {
                 queue_.pop();
                 dropped_++;
             }
-            
-            queue_.push(std::move(frame));
+            queue_.push(std::move(item));
         }
-        cond_.notify_one();  // 唤醒可能等待的消费者
+        cond_.notify_one();
     }
 
-    // 消费者：处理线程 pop
-    bool pop(Frame& frame) {
+    bool pop(T& item) {
         std::unique_lock<std::mutex> lock(mutex_);
-        
-        // 等待条件：队列非空 或 停止信号
         cond_.wait(lock, [this] { return !queue_.empty() || stop_; });
-        
-        if (queue_.empty()) return false;  // stop_ 且队列空
-        
-        frame = std::move(queue_.front());  // 所有权转移给处理线程
+        if (queue_.empty()) return false;
+        item = std::move(queue_.front());
         queue_.pop();
         return true;
     }
@@ -106,23 +113,14 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             stop_ = true;
         }
-        cond_.notify_all();  // 唤醒所有等待线程
+        cond_.notify_all();
     }
 
+    size_t dropped() const { return dropped_; }
     size_t size() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return queue_.size();
     }
-
-    size_t dropped() const { return dropped_; }
-
-private:
-    std::queue<Frame> queue_;
-    mutable std::mutex mutex_;
-    std::condition_variable cond_;
-    size_t max_size_;
-    std::atomic<bool> stop_{false};
-    std::atomic<size_t> dropped_{0};
 };
 
 // ==================== V4L2 采集器 ====================
@@ -137,23 +135,19 @@ public:
     ~V4L2Capture() { cleanup(); }
 
     bool init() {
-        // 1. 打开设备
         fd_ = open(device_, O_RDWR | O_NONBLOCK, 0);
         if (fd_ < 0) {
             perror("open");
             return false;
         }
 
-        // 2. 查询设备能力
         struct v4l2_capability cap{};
         if (ioctl(fd_, VIDIOC_QUERYCAP, &cap) < 0) {
             perror("VIDIOC_QUERYCAP");
             return false;
         }
-        std::cout << "[V4L2] Driver: " << cap.driver 
-                  << ", Card: " << cap.card << std::endl;
+        std::cout << "[V4L2] Driver: " << cap.driver << ", Card: " << cap.card << std::endl;
 
-        // 3. 设置视频格式
         struct v4l2_format fmt{};
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = WIDTH;
@@ -164,10 +158,12 @@ public:
             perror("VIDIOC_S_FMT");
             return false;
         }
-        std::cout << "[V4L2] Format: " << WIDTH << "x" << HEIGHT 
-                  << ", YUYV, " << CAPTURE_FRAMES << " frames" << std::endl;
 
-        // 4. 申请内核缓冲区
+        struct v4l2_format actual_fmt{};
+        actual_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(fd_, VIDIOC_G_FMT, &actual_fmt);
+        bytesperline_ = actual_fmt.fmt.pix.bytesperline;
+
         struct v4l2_requestbuffers req{};
         req.count = BUFFER_COUNT;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -178,7 +174,6 @@ public:
         }
         buffers_.resize(req.count);
 
-        // 5. mmap 映射
         for (size_t i = 0; i < buffers_.size(); ++i) {
             struct v4l2_buffer buf{};
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -197,67 +192,44 @@ public:
                 return false;
             }
         }
-        std::cout << "[V4L2] Mmap " << buffers_.size() << " buffers" << std::endl;
 
-        // 6. 入队所有缓冲区
         for (size_t i = 0; i < buffers_.size(); ++i) {
             struct v4l2_buffer buf{};
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
             buf.index = i;
-            if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-                perror("VIDIOC_QBUF");
-                return false;
-            }
+            ioctl(fd_, VIDIOC_QBUF, &buf);
         }
 
-        // 7. 启动视频流
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-            perror("VIDIOC_STREAMON");
-            return false;
-        }
-        std::cout << "[V4L2] Stream ON" << std::endl;
+        ioctl(fd_, VIDIOC_STREAMON, &type);
+        std::cout << "[V4L2] Stream ON, bytesperline=" << bytesperline_ << std::endl;
         return true;
     }
 
-    // 采集一帧：DQBUF -> 拷贝到应用层 -> QBUF 归还
-    bool captureFrame(Frame& out_frame) {
+    bool captureFrame(RawFrame& out) {
         struct v4l2_buffer buf{};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
 
-        // 阻塞等待帧就绪（select 做事件等待）
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(fd_, &fds);
-        struct timeval tv{2, 0}; // 2秒超时
-        int r = select(fd_ + 1, &fds, nullptr, nullptr, &tv);
-        if (r <= 0) {
-            std::cerr << "[V4L2] select timeout or error" << std::endl;
-            return false;
-        }
+        struct timeval tv{2, 0};
+        if (select(fd_ + 1, &fds, nullptr, nullptr, &tv) <= 0) return false;
 
-        // 取出内核缓冲区
-        if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
-            perror("VIDIOC_DQBUF");
-            return false;
-        }
+        if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) return false;
 
-        // 拷贝到应用层（关键：立即归还内核缓冲区）
-        out_frame.data.resize(buf.bytesused);
-        memcpy(out_frame.data.data(), buffers_[buf.index].start, buf.bytesused);
-        out_frame.size = buf.bytesused;
-        out_frame.timestamp_us = buf.timestamp.tv_sec * 1000000ULL + buf.timestamp.tv_usec;
-        out_frame.sequence = buf.sequence;
+        out.data.resize(buf.bytesused);
+        memcpy(out.data.data(), buffers_[buf.index].start, buf.bytesused);
+        out.timestamp_us = buf.timestamp.tv_sec * 1000000ULL + buf.timestamp.tv_usec;
+        out.sequence = buf.sequence;
 
-        // 立即归还缓冲区到驱动
-        if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF");
-            return false;
-        }
+        ioctl(fd_, VIDIOC_QBUF, &buf);
         return true;
     }
+
+    int getBytesPerLine() const { return bytesperline_; }
 
     void cleanup() {
         if (fd_ < 0) return;
@@ -273,109 +245,264 @@ public:
 private:
     const char* device_;
     int fd_ = -1;
+    int bytesperline_ = WIDTH * 2;
     std::vector<Buffer> buffers_;
 };
 
-// ==================== 全局控制 ====================
-std::atomic<bool> g_running{true};
-
-// ==================== 采集线程（生产者） ====================
-void captureThread(V4L2Capture& capture, FrameQueue& queue) {
+// ==================== 采集线程（无限循环） ====================
+void captureThread(V4L2Capture& capture, ThreadQueue<RawFrame>& raw_queue) {
     std::cout << "[Thread-Capture] Started" << std::endl;
     auto t_start = std::chrono::steady_clock::now();
+    int count = 0;
 
-    for (int i = 0; i < CAPTURE_FRAMES && g_running; ++i) {
-        Frame frame;
+    while (g_running) {
+        RawFrame frame;
         if (!capture.captureFrame(frame)) {
-            std::cerr << "[Thread-Capture] Capture failed at frame " << i << std::endl;
+            std::cerr << "[Thread-Capture] Capture failed" << std::endl;
             break;
         }
 
-        // 推入应用层队列（所有权转移给队列）
-        queue.push(std::move(frame));
+        raw_queue.push(std::move(frame));
+        count++;
 
-        // 每 30 帧打印状态
-        if ((i + 1) % 30 == 0) {
+        if (count % 30 == 0) {
             auto elapsed = std::chrono::steady_clock::now() - t_start;
-            double fps = (i + 1) / std::chrono::duration<double>(elapsed).count();
-            std::cout << "[Thread-Capture] Pushed: " << (i + 1) 
-                      << ", Queue size: " << queue.size()
+            double fps = count / std::chrono::duration<double>(elapsed).count();
+            std::cout << "[Thread-Capture] Pushed: " << count 
+                      << ", Queue: " << raw_queue.size()
                       << ", FPS: " << fps << std::endl;
         }
     }
 
-    // 采集结束，通知消费者退出
-    queue.stop();
-    std::cout << "[Thread-Capture] Finished, total pushed: " << CAPTURE_FRAMES << std::endl;
+    raw_queue.stop();
+    std::cout << "[Thread-Capture] Finished, total: " << count << std::endl;
 }
 
-// ==================== 处理线程（消费者） ====================
-void processThread(FrameQueue& queue) {
-    std::cout << "[Thread-Process] Started" << std::endl;
-    
-    FILE* yuv_file = fopen("/home/lxxh/Videos/output_dual_thread.yuv", "wb");
-    if (!yuv_file) {
-        perror("fopen");
+// ==================== 编码线程（无限循环） ====================
+void encodeThread(ThreadQueue<RawFrame>& raw_queue,
+                  ThreadQueue<EncodedPacket>& pkt_queue,
+                  int src_bytesperline) {
+    std::cout << "[Thread-Encode] Started" << std::endl;
+
+    // 初始化 x264 编码器
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec) {
+        std::cerr << "[Thread-Encode] x264 not found" << std::endl;
+        raw_queue.stop();
         return;
     }
 
-    int processed = 0;
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    ctx->width = WIDTH;
+    ctx->height = HEIGHT;
+    ctx->time_base = AVRational{1, FPS};
+    ctx->framerate = AVRational{FPS, 1};
+    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx->bit_rate = 2000000;
+    ctx->gop_size = FPS;               // 1秒一个I帧
+    ctx->max_b_frames = 0;
+
+    av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
+    av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
+
+    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+        std::cerr << "[Thread-Encode] Failed to open codec" << std::endl;
+        avcodec_free_context(&ctx);
+        raw_queue.stop();
+        return;
+    }
+
+    // 分配 AVFrame 和 sws
+    AVFrame* frame = av_frame_alloc();
+    frame->width = WIDTH;
+    frame->height = HEIGHT;
+    frame->format = AV_PIX_FMT_YUV420P;
+    av_frame_get_buffer(frame, 64);
+
+    SwsContext* sws = sws_getContext(
+        WIDTH, HEIGHT, AV_PIX_FMT_YUYV422,
+        WIDTH, HEIGHT, AV_PIX_FMT_YUV420P,
+        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+    );
+
+    int64_t pts = 0;
+    int encoded = 0;
     auto t_start = std::chrono::steady_clock::now();
+    RawFrame raw;
 
-    Frame frame;
-    while (queue.pop(frame)) {
-        // 模拟处理耗时（编码/图像处理等）
-        // 这里仅做文件写入 + 可选的模拟延迟
-        fwrite(frame.data.data(), 1, frame.size, yuv_file);
-        
-        // 可选：模拟处理抖动（取消注释以测试队列缓冲）
-        // std::this_thread::sleep_for(std::chrono::milliseconds(20 + rand() % 20));
-        
-        processed++;
+    while (g_running && raw_queue.pop(raw)) {
+        // YUYV422 → YUV420P
+        const uint8_t* src_data[1] = { raw.data.data() };
+        int src_linesize[1] = { src_bytesperline };
+        sws_scale(sws, src_data, src_linesize, 0, HEIGHT,
+                  frame->data, frame->linesize);
 
-        // 每 30 帧打印状态
-        if (processed % 30 == 0) {
+        frame->pts = pts++;
+
+        // 编码
+        avcodec_send_frame(ctx, frame);
+        AVPacket* pkt = av_packet_alloc();
+
+        while (true) {
+            int ret = avcodec_receive_packet(ctx, pkt);
+            if (ret == AVERROR(EAGAIN)) break;
+            if (ret < 0) break;
+
+            EncodedPacket ep;
+            ep.data.resize(pkt->size);
+            memcpy(ep.data.data(), pkt->data, pkt->size);
+            ep.pts = pkt->pts;
+            ep.dts = pkt->dts;
+            ep.is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+
+            pkt_queue.push(std::move(ep));
+            av_packet_unref(pkt);
+        }
+        av_packet_free(&pkt);
+        encoded++;
+
+        if (encoded % 30 == 0) {
             auto elapsed = std::chrono::steady_clock::now() - t_start;
-            double fps = processed / std::chrono::duration<double>(elapsed).count();
-            std::cout << "[Thread-Process] Processed: " << processed 
-                      << ", Queue dropped: " << queue.dropped()
-                      << ", Avg FPS: " << fps << std::endl;
+            double fps = encoded / std::chrono::duration<double>(elapsed).count();
+            std::cout << "[Thread-Encode] Encoded: " << encoded 
+                      << ", Queue dropped: " << raw_queue.dropped()
+                      << ", FPS: " << fps << std::endl;
         }
     }
 
-    fclose(yuv_file);
-    auto total_elapsed = std::chrono::steady_clock::now() - t_start;
-    double avg_fps = processed / std::chrono::duration<double>(total_elapsed).count();
-    
-    std::cout << "[Thread-Process] Finished. Total: " << processed 
-              << ", Dropped: " << queue.dropped()
-              << ", Final Avg FPS: " << avg_fps << std::endl;
+    // 刷新编码器
+    avcodec_send_frame(ctx, nullptr);
+    AVPacket* pkt = av_packet_alloc();
+    while (avcodec_receive_packet(ctx, pkt) >= 0) {
+        EncodedPacket ep;
+        ep.data.resize(pkt->size);
+        memcpy(ep.data.data(), pkt->data, pkt->size);
+        ep.pts = pkt->pts;
+        ep.dts = pkt->dts;
+        ep.is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+        pkt_queue.push(std::move(ep));
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+
+    sws_freeContext(sws);
+    av_frame_free(&frame);
+    avcodec_free_context(&ctx);
+    pkt_queue.stop();
+
+    std::cout << "[Thread-Encode] Finished, total: " << encoded << std::endl;
+}
+
+// ==================== 推流线程（无限循环） ====================
+void streamThread(ThreadQueue<EncodedPacket>& pkt_queue, const char* rtmp_url) {
+    std::cout << "[Thread-Stream] Started, URL: " << rtmp_url << std::endl;
+
+    // 初始化 FFmpeg 输出上下文
+    AVFormatContext* fmt_ctx = nullptr;
+    avformat_alloc_output_context2(&fmt_ctx, nullptr, "flv", rtmp_url);
+    if (!fmt_ctx) {
+        std::cerr << "[Thread-Stream] Failed to alloc output context" << std::endl;
+        pkt_queue.stop();
+        return;
+    }
+
+    // 创建视频流
+    AVStream* stream = avformat_new_stream(fmt_ctx, nullptr);
+    stream->id = 0;
+    stream->time_base = (AVRational){1, FPS};
+
+    AVCodecParameters* codecpar = stream->codecpar;
+    codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    codecpar->codec_id = AV_CODEC_ID_H264;
+    codecpar->width = WIDTH;
+    codecpar->height = HEIGHT;
+    codecpar->format = AV_PIX_FMT_YUV420P;
+
+    // 打开 RTMP 连接
+    if (avio_open(&fmt_ctx->pb, rtmp_url, AVIO_FLAG_WRITE) < 0) {
+        std::cerr << "[Thread-Stream] Failed to open RTMP" << std::endl;
+        avformat_free_context(fmt_ctx);
+        pkt_queue.stop();
+        return;
+    }
+
+    // 写 FLV 头
+    avformat_write_header(fmt_ctx, nullptr);
+    std::cout << "[Thread-Stream] RTMP connected, streaming..." << std::endl;
+
+    // 推流循环
+    EncodedPacket ep;
+    //int64_t start_time = av_gettime_relative();
+    auto start_time = std::chrono::steady_clock::now();
+    int sent = 0;
+
+    while (g_running && pkt_queue.pop(ep)) {
+        AVPacket pkt;
+        av_init_packet(&pkt);
+        pkt.data = ep.data.data();
+        pkt.size = ep.data.size();
+        pkt.pts = ep.pts;
+        pkt.dts = ep.dts;
+        pkt.stream_index = 0;
+
+        if (ep.is_keyframe) {
+            pkt.flags |= AV_PKT_FLAG_KEY;
+        }
+
+        // 时间戳转换
+        av_packet_rescale_ts(&pkt, (AVRational){1, FPS}, stream->time_base);
+
+        // 写入（FFmpeg 内部：NAL → AVCC → FLV Tag → RTMP Chunk）
+        av_interleaved_write_frame(fmt_ctx, &pkt);
+
+        sent++;
+
+        if (sent % 30 == 0) {
+            std::cout << "[Thread-Stream] Sent: " << sent << std::endl;
+        }
+    }
+
+    // 结束
+    av_write_trailer(fmt_ctx);
+    avio_close(fmt_ctx->pb);
+    avformat_free_context(fmt_ctx);
+
+    std::cout << "[Thread-Stream] Finished, total: " << sent << std::endl;
 }
 
 // ==================== 主函数 ====================
 int main(int argc, char** argv) {
-    const char* device = (argc > 1) ? argv[1] : "/dev/video0";
-    
+    // 信号处理：Ctrl+C 优雅退出
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    const char* device = (argc > 2) ? argv[2] : "/dev/video0";
+    const char* rtmp_url = (argc > 1) ? argv[1] : "rtmp://8.138.232.209/live/test001";
+
+    // 初始化 FFmpeg 网络库
+    avformat_network_init();
+
     V4L2Capture capture(device);
     if (!capture.init()) {
         std::cerr << "V4L2 init failed" << std::endl;
         return -1;
     }
 
-    FrameQueue queue(QUEUE_MAX_SIZE);
+    ThreadQueue<RawFrame> raw_queue(RAW_QUEUE_SIZE);
+    ThreadQueue<EncodedPacket> pkt_queue(PKT_QUEUE_SIZE);
 
-    // 启动双线程
-    std::thread t_capture(captureThread, std::ref(capture), std::ref(queue));
-    std::thread t_process(processThread, std::ref(queue));
+    // 启动三级线程
+    std::thread t_capture(captureThread, std::ref(capture), std::ref(raw_queue));
+    std::thread t_encode(encodeThread, std::ref(raw_queue), std::ref(pkt_queue),
+                         capture.getBytesPerLine());
+    std::thread t_stream(streamThread, std::ref(pkt_queue), rtmp_url);
 
     t_capture.join();
-    t_process.join();
+    t_encode.join();
+    t_stream.join();
 
-    std::cout << "[Main] All threads joined. Check output_dual_thread.yuv" << std::endl;
-    
-    // 查看结果
-    std::cout << "Play with: ffplay -f rawvideo -pixel_format yuyv422 -video_size " 
-              << WIDTH << "x" << HEIGHT << " output_dual_thread.yuv" << std::endl;
-    
+    avformat_network_deinit();
+    std::cout << "[Main] Pipeline stopped gracefully" << std::endl;
+
     return 0;
 }

@@ -17,6 +17,7 @@ pkg_check_modules(FFMPEG REQUIRED
     libavcodec 
     libavutil 
     libswscale
+    libavformat
 )
 
 add_executable(getv
